@@ -30,7 +30,7 @@ import (
 	"k8s.io/kubernetes/pkg/probe"
 )
 
-const FailureCode int = -1
+const FailureCode = http.StatusInternalServerError
 
 func containsAny(s string, substrs []string) bool {
 	for _, substr := range substrs {
