@@ -18,20 +18,32 @@ package oidc
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/coreos/go-oidc/jose"
-	"github.com/coreos/go-oidc/oauth2"
-	"github.com/coreos/go-oidc/oidc"
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
+
+	"github.com/ericchiang/oidc"
 	"github.com/golang/glog"
 
 	"k8s.io/kubernetes/pkg/client/restclient"
 	"k8s.io/kubernetes/pkg/util/wait"
 )
+
+// expiryDelta determines how earlier a token should be considered
+// expired than its actual expiration time. It is used to avoid late
+// expirations due to client-server time mismatches.
+//
+// NOTE(ericchiang): This is taken from golang.org/x/oauth2 to try to
+// match its behavor, though no logic depends on it being identical.
+const expiryDelta = 10 * time.Second
 
 const (
 	cfgIssuerUrl                = "idp-issuer-url"
@@ -54,12 +66,12 @@ var (
 )
 
 func init() {
-	if err := restclient.RegisterAuthProviderPlugin("oidc", newOIDCAuthProvider); err != nil {
+	if err := restclient.RegisterAuthProviderPlugin("oidc", newAuthProvider); err != nil {
 		glog.Fatalf("Failed to register oidc auth plugin: %v", err)
 	}
 }
 
-func newOIDCAuthProvider(_ string, cfg map[string]string, persister restclient.AuthProviderConfigPersister) (restclient.AuthProvider, error) {
+func newAuthProvider(_ string, cfg map[string]string, persister restclient.AuthProviderConfigPersister) (restclient.AuthProvider, error) {
 	issuer := cfg[cfgIssuerUrl]
 	if issuer == "" {
 		return nil, fmt.Errorf("Must provide %s", cfgIssuerUrl)
@@ -75,196 +87,187 @@ func newOIDCAuthProvider(_ string, cfg map[string]string, persister restclient.A
 		return nil, fmt.Errorf("Must provide %s", cfgClientSecret)
 	}
 
-	var certAuthData []byte
-	var err error
+	tlsConfig := restclient.TLSClientConfig{CAFile: cfg[cfgCertificateAuthority]}
+
 	if cfg[cfgCertificateAuthorityData] != "" {
-		certAuthData, err = base64.StdEncoding.DecodeString(cfg[cfgCertificateAuthorityData])
+		caData, err := base64.StdEncoding.DecodeString(cfg[cfgCertificateAuthorityData])
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to decode ca data: %v", err)
 		}
+		tlsConfig.CAData = caData
 	}
 
-	clientConfig := restclient.Config{
-		TLSClientConfig: restclient.TLSClientConfig{
-			CAFile: cfg[cfgCertificateAuthority],
-			CAData: certAuthData,
-		},
-	}
+	clientConfig := restclient.Config{TLSClientConfig: tlsConfig}
 
 	trans, err := restclient.TransportFor(&clientConfig)
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{Transport: trans}
 
-	providerCfg, err := oidc.FetchProviderConfig(hc, issuer)
-	if err != nil {
-		return nil, fmt.Errorf("error fetching provider config: %v", err)
-	}
+	return &authProvider{
+		issuerURL:    issuer,
+		issuerClient: &http.Client{Transport: trans},
 
-	scopes := strings.Split(cfg[cfgExtraScopes], ",")
-	oidcCfg := oidc.ClientConfig{
-		HTTPClient: hc,
-		Credentials: oidc.ClientCredentials{
-			ID:     clientID,
-			Secret: clientSecret,
-		},
-		ProviderConfig: providerCfg,
-		Scope:          append(scopes, oidc.DefaultScope...),
-	}
+		clientID:     clientID,
+		clientSecret: clientSecret,
 
-	client, err := oidc.NewClient(oidcCfg)
-	if err != nil {
-		return nil, fmt.Errorf("error creating OIDC Client: %v", err)
-	}
+		refreshToken: cfg[cfgRefreshToken],
+		idToken:      cfg[cfgIDToken],
+		persister:    persister,
+		cfg:          cfg,
 
-	oClient := &oidcClient{client}
-
-	var initialIDToken jose.JWT
-	if cfg[cfgIDToken] != "" {
-		initialIDToken, err = jose.ParseJWT(cfg[cfgIDToken])
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return &oidcAuthProvider{
-		initialIDToken: initialIDToken,
-		refresher: &idTokenRefresher{
-			client:    oClient,
-			cfg:       cfg,
-			persister: persister,
+		now: func() time.Time {
+			return time.Now().Add(expiryDelta)
 		},
 	}, nil
 }
 
-type oidcAuthProvider struct {
-	refresher      *idTokenRefresher
-	initialIDToken jose.JWT
+type authProvider struct {
+	issuerURL    string
+	issuerClient *http.Client
+
+	clientID     string
+	clientSecret string
+
+	refreshToken string
+
+	now func() time.Time
+
+	provider atomic.Value // always of type *oidc.Provider
+
+	// mu guards all of the following fields
+	mu      sync.Mutex
+	idToken string
+	// TODO(ericchiang): AuthProviderConfigPersister is racy because we can
+	// only write to it and never read. Need to figure out how to deal with
+	// concurrent clients using the same provider.
+	persister restclient.AuthProviderConfigPersister
+	cfg       map[string]string
 }
 
-func (g *oidcAuthProvider) WrapTransport(rt http.RoundTripper) http.RoundTripper {
-	at := &oidc.AuthenticatedTransport{
-		TokenRefresher: g.refresher,
-		RoundTripper:   rt,
+func (p *authProvider) getProvider() (*oidc.Provider, bool) {
+	provider, ok := p.provider.Load().(*oidc.Provider)
+	return provider, ok
+}
+
+func (p *authProvider) setProvider(provider *oidc.Provider) {
+	p.provider.Store(provider)
+}
+
+func (p *authProvider) setIDToken(idToken string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	newCfg := make(map[string]string, len(p.cfg))
+	for key, val := range p.cfg {
+		newCfg[key] = val
 	}
-	at.SetJWT(g.initialIDToken)
-	return &roundTripper{
-		wrapped:   at,
-		refresher: g.refresher,
-	}
-}
+	newCfg[cfgIDToken] = idToken
 
-func (g *oidcAuthProvider) Login() error {
-	return errors.New("not yet implemented")
-}
-
-type OIDCClient interface {
-	refreshToken(rt string) (oauth2.TokenResponse, error)
-	verifyJWT(jwt jose.JWT) error
-}
-
-type roundTripper struct {
-	refresher *idTokenRefresher
-	wrapped   *oidc.AuthenticatedTransport
-}
-
-func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	var res *http.Response
-	var err error
-	firstTime := true
-	wait.ExponentialBackoff(backoff, func() (bool, error) {
-		if !firstTime {
-			var jwt jose.JWT
-			jwt, err = r.refresher.Refresh()
-			if err != nil {
-				return true, nil
-			}
-			r.wrapped.SetJWT(jwt)
-		} else {
-			firstTime = false
-		}
-
-		res, err = r.wrapped.RoundTrip(req)
-		if err != nil {
-			return true, nil
-		}
-		if res.StatusCode == http.StatusUnauthorized {
-			return false, nil
-		}
-		return true, nil
-	})
-	return res, err
-}
-
-type idTokenRefresher struct {
-	cfg           map[string]string
-	client        OIDCClient
-	persister     restclient.AuthProviderConfigPersister
-	intialIDToken jose.JWT
-}
-
-func (r *idTokenRefresher) Verify(jwt jose.JWT) error {
-	claims, err := jwt.Claims()
-	if err != nil {
+	if err := p.persister.Persist(newCfg); err != nil {
 		return err
 	}
-
-	now := time.Now()
-	exp, ok, err := claims.TimeClaim("exp")
-	switch {
-	case err != nil:
-		return fmt.Errorf("failed to parse 'exp' claim: %v", err)
-	case !ok:
-		return errors.New("missing required 'exp' claim")
-	case exp.Before(now):
-		return fmt.Errorf("token already expired at: %v", exp)
-	}
+	p.cfg = newCfg
+	p.idToken = idToken
 
 	return nil
 }
 
-func (r *idTokenRefresher) Refresh() (jose.JWT, error) {
-	rt, ok := r.cfg[cfgRefreshToken]
+func (p *authProvider) getIDToken() (idToken string, valid bool) {
+	p.mu.Lock()
+	idToken = p.idToken
+	p.mu.Unlock()
+
+	if idToken == "" {
+		return "", false
+	}
+
+	// Parse the JWT payload. Because the API server does its own verification of the
+	// id token, don't bother trying to verify it here.
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", false
+	}
+
+	// Unmarshal payload.
+	var t struct {
+		// Some providers return floats. blah.
+		Expiry json.Number `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &t); err != nil {
+		return "", false
+	}
+
+	var expiry time.Time
+	if n, err := t.Expiry.Int64(); err != nil {
+		if f, err := t.Expiry.Float64(); err != nil {
+			return "", false
+		} else {
+			expiry = time.Unix(int64(f), 0)
+		}
+	} else {
+		expiry = time.Unix(n, 0)
+	}
+
+	return idToken, p.now().After(expiry)
+}
+
+func (a *authProvider) WrapTransport(rt http.RoundTripper) http.RoundTripper {
+	return &transport{a, rt}
+}
+
+// TODO(ericchiang): Login is never called and doesn't have a concrete implementation between
+// any of the existing AuthProviders. Should probably remove it from the AuthProvider interface
+// until we have evidence that it's useful.
+func (g *authProvider) Login() error {
+	return errors.New("not yet implemented")
+}
+
+type transport struct {
+	provider  *authProvider
+	transport http.RoundTripper
+}
+
+func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	idToken, ok := t.provider.getIDToken()
 	if !ok {
-		return jose.JWT{}, errors.New("No valid id-token, and cannot refresh without refresh-token")
+		ctx := context.WithValue(context.TODO(), oauth2.HTTPClient, t.provider.issuerClient)
+
+		p, ok := t.provider.getProvider()
+		if !ok {
+			provider, err := oidc.NewProvider(ctx, t.provider.issuerURL)
+			if err != nil {
+				return nil, err
+			}
+			t.provider.setProvider(provider)
+			p = provider
+		}
+
+		config := oauth2.Config{
+			ClientID:     t.provider.clientID,
+			ClientSecret: t.provider.clientSecret,
+			Endpoint:     p.Endpoint(),
+		}
+
+		ts := config.TokenSource(ctx, &oauth2.Token{RefreshToken: t.provider.refreshToken})
+
+		token, err := ts.Token()
+		if err != nil {
+			return nil, fmt.Errorf("refreshing token: %v", err)
+		}
+		idToken, ok = token.Extra("id_token").(string)
+		if !ok {
+			return nil, fmt.Errorf("oidc: refreshed token did not contain an id_token field")
+		}
+
+		if err := t.provider.setIDToken(idToken); err != nil {
+			return nil, fmt.Errorf("oidc: failed to persist new id token: %v", err)
+		}
 	}
-
-	tokens, err := r.client.refreshToken(rt)
-	if err != nil {
-		return jose.JWT{}, fmt.Errorf("could not refresh token: %v", err)
-	}
-	jwt, err := jose.ParseJWT(tokens.IDToken)
-	if err != nil {
-		return jose.JWT{}, err
-	}
-
-	if tokens.RefreshToken != "" && tokens.RefreshToken != rt {
-		r.cfg[cfgRefreshToken] = tokens.RefreshToken
-	}
-	r.cfg[cfgIDToken] = jwt.Encode()
-
-	err = r.persister.Persist(r.cfg)
-	if err != nil {
-		return jose.JWT{}, fmt.Errorf("could not perist new tokens: %v", err)
-	}
-
-	return jwt, r.client.verifyJWT(jwt)
-}
-
-type oidcClient struct {
-	client *oidc.Client
-}
-
-func (o *oidcClient) refreshToken(rt string) (oauth2.TokenResponse, error) {
-	oac, err := o.client.OAuthClient()
-	if err != nil {
-		return oauth2.TokenResponse{}, err
-	}
-
-	return oac.RequestToken(oauth2.GrantTypeRefreshToken, rt)
-}
-
-func (o *oidcClient) verifyJWT(jwt jose.JWT) error {
-	return o.client.VerifyJWT(jwt)
+	req.Header.Set("Authorization", "Bearer "+idToken)
+	return t.transport.RoundTrip(req)
 }
