@@ -27,23 +27,27 @@ oidc implements the authenticator.Token interface using the OpenID Connect proto
 package oidc
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
-	"sync"
 	"sync/atomic"
+	"time"
 
-	"github.com/coreos/go-oidc/jose"
-	"github.com/coreos/go-oidc/oidc"
+	oidc "github.com/coreos/go-oidc"
 	"github.com/golang/glog"
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/authentication/user"
 	certutil "k8s.io/client-go/util/cert"
 )
+
+const pollInterval = time.Second * 30
 
 type OIDCOptions struct {
 	// IssuerURL is the URL the provider signs ID Tokens as. This will be the "iss"
@@ -85,14 +89,10 @@ type OIDCAuthenticator struct {
 	usernameClaim string
 	groupsClaim   string
 
-	httpClient *http.Client
+	// Contains an *oidc.IDTokenVerifier. Do not access directly. Use verifier() method.
+	oidcVerifier atomic.Value
 
-	// Contains an *oidc.Client. Do not access directly. Use client() method.
-	oidcClient atomic.Value
-
-	// Guards the close method and is used to lock during initialization and closing.
-	mu    sync.Mutex
-	close func() // May be nil
+	close context.CancelFunc
 }
 
 // New creates a token authenticator which validates OpenID Connect ID Tokens.
@@ -127,138 +127,102 @@ func New(opts OIDCOptions) (*OIDCAuthenticator, error) {
 		TLSClientConfig: &tls.Config{RootCAs: roots},
 	})
 
-	authenticator := &OIDCAuthenticator{
+	ctx, cancel := context.WithCancel()
+	ctx = oidc.ClientContext(ctx, &http.Client{Transport: tr})
+
+	a := &OIDCAuthenticator{
 		issuerURL:       opts.IssuerURL,
 		trustedClientID: opts.ClientID,
 		usernameClaim:   opts.UsernameClaim,
 		groupsClaim:     opts.GroupsClaim,
-		httpClient:      &http.Client{Transport: tr},
+		cancel:          cancel,
 	}
 
-	// Attempt to initialize the authenticator asynchronously.
-	//
-	// Ignore errors instead of returning it since the OpenID Connect provider might not be
-	// available yet, for instance if it's running on the cluster and needs the API server
-	// to come up first. Errors will be logged within the client() method.
-	go func() {
-		defer runtime.HandleCrash()
-		authenticator.client()
-	}()
+	initAuthenticator := wait.ConditionFunc(func() (done bool, err error) {
+		p, err := oidc.NewProvider(ctx, a.issuerURL)
+		if err != nil {
+			// Ignore errors instead of returning it since the OpenID Connect provider might not be
+			// available yet, for instance if it's running on the cluster and needs the API server
+			// to come up first. Errors will be logged within the verifier() method.
+			runtime.HandleError(fmt.Errorf("oidc authenticator failed to fetch provider metadata: %v", err))
+			return false, nil
+		}
 
-	return authenticator, nil
+		verifier := p.Verifier(&oidc.Config{
+			ClientID: a.trustedClientID,
+			// TODO(ericchiang): Support more signing algorithms, possibly through a flag
+			// or by inpecting the id_token_signing_alg_values_supported metadata claim.
+			SupportedSigningAlgs: []string{oidc.RS256},
+		})
+		a.oidcVerifier.Store(verifier)
+		return true, nil
+	})
+
+	if ok, _ := initAuthenticator(); !ok {
+		// Attempt to initialize the authenticator asynchronously.
+		go func() {
+			defer runtime.HandleCrash()
+			wait.PollUntil(pollInterval, initAuthenticator, ctx.Done())
+		}()
+	}
+
+	return a, nil
 }
 
 // Close stops all goroutines used by the authenticator.
 func (a *OIDCAuthenticator) Close() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.close != nil {
-		a.close()
-	}
-	return
+	a.close()
 }
 
-func (a *OIDCAuthenticator) client() (*oidc.Client, error) {
-	// Fast check to see if client has already been initialized.
-	if client := a.oidcClient.Load(); client != nil {
-		return client.(*oidc.Client), nil
+func (a *OIDCAuthenticator) verifier() (*oidc.IDTokenVerifier, error) {
+	if v := a.oidcVerifier.Load(); v != nil {
+		return client.(*v.IDTokenVerifier), nil
 	}
-
-	// Acquire lock, then recheck initialization.
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if client := a.oidcClient.Load(); client != nil {
-		return client.(*oidc.Client), nil
-	}
-
-	// Try to initialize client.
-	providerConfig, err := oidc.FetchProviderConfig(a.httpClient, a.issuerURL)
-	if err != nil {
-		glog.Errorf("oidc authenticator: failed to fetch provider discovery data: %v", err)
-		return nil, fmt.Errorf("fetch provider config: %v", err)
-	}
-
-	clientConfig := oidc.ClientConfig{
-		HTTPClient:     a.httpClient,
-		Credentials:    oidc.ClientCredentials{ID: a.trustedClientID},
-		ProviderConfig: providerConfig,
-	}
-
-	client, err := oidc.NewClient(clientConfig)
-	if err != nil {
-		glog.Errorf("oidc authenticator: failed to create client: %v", err)
-		return nil, fmt.Errorf("create client: %v", err)
-	}
-
-	// SyncProviderConfig will start a goroutine to periodically synchronize the provider config.
-	// The synchronization interval is set by the expiration length of the config, and has a minimum
-	// and maximum threshold.
-	stop := client.SyncProviderConfig(a.issuerURL)
-	a.oidcClient.Store(client)
-	a.close = func() {
-		// This assumes the stop is an unbuffered channel.
-		// So instead of closing the channel, we send am empty struct here.
-		// This guarantees that when this function returns, there is no flying requests,
-		// because a send to an unbuffered channel happens after the receive from the channel.
-		stop <- struct{}{}
-	}
-	return client, nil
+	return nil, errors.New("oidc: plugin failed to initialize")
 }
 
 // AuthenticateToken decodes and verifies an ID Token using the OIDC client, if the verification succeeds,
 // then it will extract the user info from the JWT claims.
 func (a *OIDCAuthenticator) AuthenticateToken(value string) (user.Info, bool, error) {
-	jwt, err := jose.ParseJWT(value)
+	verifier, err := a.verifier()
 	if err != nil {
 		return nil, false, err
 	}
 
-	client, err := a.client()
-	if err != nil {
-		return nil, false, err
-	}
-	if err := client.VerifyJWT(jwt); err != nil {
-		return nil, false, err
-	}
-
-	claims, err := jwt.Claims()
+	idToken, err := verifier.Verify(context.TODO(), value)
 	if err != nil {
 		return nil, false, err
 	}
 
-	claim, ok, err := claims.StringClaim(a.usernameClaim)
-	if err != nil {
-		return nil, false, err
-	}
-	if !ok {
-		return nil, false, fmt.Errorf("cannot find %q in JWT claims", a.usernameClaim)
+	c := new(claims)
+	if err := idToken.Claims(c); err != nil {
+		return nil, false, fmt.Errorf("parse claims: %v", err)
 	}
 
 	var username string
+	ok, err := c.claim(a.usernameClaim, &username)
+	switch {
+	case err != nil:
+		return nil, false, fmt.Errorf("failed to parse '%s' claim %v", a.usernameClaim, err)
+	case !ok:
+		return nil, false, fmt.Errorf("'%s' claim not present", a.usernameClaim)
+	}
+
 	switch a.usernameClaim {
 	case "email":
-		verified, ok := claims["email_verified"]
-		if !ok {
+		var verified bool
+		ok, err := c.claim("email_verified", &verified)
+		switch {
+		case err != nil:
+			return nil, false, fmt.Errorf("failed to parse 'email_verified claim' %v", err)
+		case !ok:
 			return nil, false, errors.New("'email_verified' claim not present")
-		}
-
-		emailVerified, ok := verified.(bool)
-		if !ok {
-			// OpenID Connect spec defines 'email_verified' as a boolean. For now, be a pain and error if
-			// it's a different type. If there are enough misbehaving providers we can relax this latter.
-			//
-			// See: https://openid.net/specs/openid-connect-core-1_0.html#StandardClaims
-			return nil, false, fmt.Errorf("malformed claim 'email_verified', expected boolean got %T", verified)
-		}
-
-		if !emailVerified {
+		case !verified:
 			return nil, false, errors.New("email not verified")
 		}
-		username = claim
 	default:
 		// For all other cases, use issuerURL + claim as the user name.
-		username = fmt.Sprintf("%s#%s", a.issuerURL, claim)
+		username = fmt.Sprintf("%s#%s", a.issuerURL, username)
 	}
 
 	// TODO(yifan): Add UID, also populate the issuer to upper layer.
@@ -279,4 +243,22 @@ func (a *OIDCAuthenticator) AuthenticateToken(value string) (user.Info, bool, er
 		}
 	}
 	return info, true, nil
+}
+
+type claims struct {
+	m map[string]json.RawMessage
+}
+
+func (c *claims) UnmarshalJSON(b []byte) error {
+	c.m = make(map[string]json.RawMessage)
+	return json.Unmarshal(b, c.m)
+}
+
+func (c *claims) claim(key string, into interface{}) (bool, error) {
+	rm, ok := c.m[key]
+	if !ok {
+		return false, nil
+	}
+	err = json.Unmarshal([]byte(rm), into)
+	return
 }
