@@ -17,320 +17,566 @@ limitations under the License.
 package oidc
 
 import (
-	"fmt"
-	"os"
-	"path"
-	"reflect"
+	"crypto/tls"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"sort"
-	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/coreos/go-oidc/jose"
-	"github.com/coreos/go-oidc/oidc"
+	jose "gopkg.in/square/go-jose.v2"
 
-	"k8s.io/apiserver/pkg/authentication/user"
-	oidctesting "k8s.io/apiserver/plugin/pkg/authenticator/token/oidc/testing"
+	"k8s.io/apiserver/plugin/pkg/authenticator/token/oidc/oidctest"
 )
 
-func generateToken(t *testing.T, op *oidctesting.OIDCProvider, iss, sub, aud string, usernameClaim, value, groupsClaim string, groups interface{}, iat, exp time.Time, emailVerified bool) string {
-	claims := oidc.NewClaims(iss, sub, aud, iat, exp)
-	claims.Add(usernameClaim, value)
-	if groups != nil && groupsClaim != "" {
-		claims.Add(groupsClaim, groups)
-	}
-	claims.Add("email_verified", emailVerified)
+func TestClaimsParsing(t *testing.T) {
+	rawClaims := []byte(`{
+     "iss": "https://server.example.com",
+     "sub": "24400320",
+     "aud": "s6BhdRkqt3",
+     "nonce": "n-0S6_WzA2Mj",
+     "exp": 1311281970,
+     "iat": 1311280970,
+     "auth_time": 1311280969,
+     "acr": "urn:mace:incommon:iap:silver"
+    }`)
 
-	signer := op.PrivKey.Signer()
-	jwt, err := jose.NewSignedJWT(claims, signer)
+	c := new(claims)
+	if err := json.Unmarshal(rawClaims, c); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		issuer     string
+		wantIssuer string = "https://server.example.com"
+	)
+	found, err := c.claim("iss", &issuer)
+	switch {
+	case err != nil:
+		t.Errorf("failed to parse issuer claim: %v", err)
+	case !found:
+		t.Errorf("iss claim not found")
+	case issuer != wantIssuer:
+		t.Errorf("expected issuer %s got %s", wantIssuer, issuer)
+	}
+
+	var (
+		exp     int
+		wantExp int = 1311281970
+	)
+	found, err = c.claim("exp", &exp)
+	switch {
+	case err != nil:
+		t.Errorf("failed to parse exp claim: %v", err)
+	case !found:
+		t.Errorf("exp claim not found")
+	case exp != wantExp:
+		t.Errorf("expected exp %d got %d", wantExp, exp)
+	}
+
+	found, err = c.claim("no a key", &exp)
+	switch {
+	case err != nil:
+		t.Errorf("expected nil error for unfound key, got: %v", err)
+	case found:
+		t.Errorf("expected key not found")
+	}
+}
+
+func TestOIDCPlugin(t *testing.T) {
+	var p *oidctest.Provider
+	f := func(w http.ResponseWriter, r *http.Request) { p.ServeHTTP(w, r) }
+	s := httptest.NewUnstartedServer(http.HandlerFunc(f))
+	cert, err := tls.LoadX509KeyPair("testdata/server.crt", "testdata/server.key")
 	if err != nil {
-		t.Fatalf("Cannot generate token: %v", err)
-		return ""
+		t.Fatal(err)
 	}
-	return jwt.Encode()
-}
+	s.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	s.StartTLS()
+	defer s.Close()
 
-func generateTokenWithUnverifiedEmail(t *testing.T, op *oidctesting.OIDCProvider, iss, sub, aud string, email string) string {
-	return generateToken(t, op, iss, sub, aud, "email", email, "", nil, time.Now(), time.Now().Add(time.Hour), false)
-}
+	p, err = oidctest.NewProvider(s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-func generateGoodToken(t *testing.T, op *oidctesting.OIDCProvider, iss, sub, aud string, usernameClaim, value, groupsClaim string, groups interface{}) string {
-	return generateToken(t, op, iss, sub, aud, usernameClaim, value, groupsClaim, groups, time.Now(), time.Now().Add(time.Hour), true)
-}
-
-func generateMalformedToken(t *testing.T, op *oidctesting.OIDCProvider, iss, sub, aud string, usernameClaim, value, groupsClaim string, groups interface{}) string {
-	return generateToken(t, op, iss, sub, aud, usernameClaim, value, groupsClaim, groups, time.Now(), time.Now().Add(time.Hour), true) + "randombits"
-}
-
-func generateExpiredToken(t *testing.T, op *oidctesting.OIDCProvider, iss, sub, aud string, usernameClaim, value, groupsClaim string, groups interface{}) string {
-	return generateToken(t, op, iss, sub, aud, usernameClaim, value, groupsClaim, groups, time.Now().Add(-2*time.Hour), time.Now().Add(-1*time.Hour), true)
-}
-
-func TestTLSConfig(t *testing.T) {
-	// Verify the cert/key pair works.
-	cert1 := path.Join(os.TempDir(), "oidc-cert-1")
-	key1 := path.Join(os.TempDir(), "oidc-key-1")
-	cert2 := path.Join(os.TempDir(), "oidc-cert-2")
-	key2 := path.Join(os.TempDir(), "oidc-key-2")
-
-	defer os.Remove(cert1)
-	defer os.Remove(key1)
-	defer os.Remove(cert2)
-	defer os.Remove(key2)
-
-	oidctesting.GenerateSelfSignedCert(t, "127.0.0.1", cert1, key1)
-	oidctesting.GenerateSelfSignedCert(t, "127.0.0.1", cert2, key2)
+	now := time.Now()
 
 	tests := []struct {
-		testCase string
-
-		serverCertFile string
-		serverKeyFile  string
-
-		trustedCertFile string
+		name    string
+		options OIDCOptions
+		// Claims are marshaled and signed by the provider.
+		claims map[string]interface{}
 
 		wantErr bool
+
+		wantName   string
+		wantGroups []string
 	}{
 		{
-			testCase:       "provider using untrusted custom cert",
-			serverCertFile: cert1,
-			serverKeyFile:  key1,
-			wantErr:        true,
+			name: "valid_token",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "sub",
+			},
+			claims: map[string]interface{}{
+				"iss": s.URL,
+				"aud": "myid",
+				"sub": "1234",
+				"exp": now.Add(time.Hour).Unix(),
+				"iat": now.Unix(),
+			},
+			wantName: s.URL + "#" + "1234",
 		},
 		{
-			testCase:        "provider using untrusted cert",
-			serverCertFile:  cert1,
-			serverKeyFile:   key1,
-			trustedCertFile: cert2,
-			wantErr:         true,
+			name: "wrong_issuer",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "sub",
+			},
+			claims: map[string]interface{}{
+				"iss": "https://example.com",
+				"aud": "myid",
+				"sub": "1234",
+				"exp": now.Add(time.Hour).Unix(),
+				"iat": now.Unix(),
+			},
+			wantErr: true,
 		},
 		{
-			testCase:        "provider using trusted cert",
-			serverCertFile:  cert1,
-			serverKeyFile:   key1,
-			trustedCertFile: cert1,
-			wantErr:         false,
+			name: "wrong_ca",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/bad.crt",
+				UsernameClaim: "sub",
+			},
+			claims: map[string]interface{}{
+				"iss": s.URL,
+				"aud": "myid",
+				"sub": "1234",
+				"exp": now.Add(time.Hour).Unix(),
+				"iat": now.Unix(),
+			},
+			wantErr: true,
+		},
+		{
+			name: "email",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "email",
+			},
+			claims: map[string]interface{}{
+				"iss":            s.URL,
+				"aud":            "myid",
+				"email":          "jane.doe@example.com",
+				"email_verified": true,
+				"sub":            "1234",
+				"exp":            now.Add(time.Hour).Unix(),
+				"iat":            now.Unix(),
+			},
+			wantName: "jane.doe@example.com",
+		},
+		{
+			name: "email_not_verified",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "email",
+			},
+			claims: map[string]interface{}{
+				"iss":            s.URL,
+				"aud":            "myid",
+				"email":          "jane.doe@example.com",
+				"email_verified": false,
+				"sub":            "1234",
+				"exp":            now.Add(time.Hour).Unix(),
+				"iat":            now.Unix(),
+			},
+			wantErr: true,
+		},
+		{
+			name: "email_verified_not_present",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "email",
+			},
+			claims: map[string]interface{}{
+				"iss":   s.URL,
+				"aud":   "myid",
+				"email": "jane.doe@example.com",
+				"sub":   "1234",
+				"exp":   now.Add(time.Hour).Unix(),
+				"iat":   now.Unix(),
+			},
+			wantErr: true,
+		},
+		{
+			name: "wrong_client_id",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "email",
+			},
+			claims: map[string]interface{}{
+				"iss":   s.URL,
+				"aud":   "badid",
+				"email": "jane.doe@example.com",
+				"sub":   "1234",
+				"exp":   now.Add(time.Hour).Unix(),
+				"iat":   now.Unix(),
+			},
+			wantErr: true,
+		},
+		{
+			name: "multiple_audiences",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "email",
+			},
+			claims: map[string]interface{}{
+				"iss":   s.URL,
+				"aud":   []string{"badid", "myid"},
+				"email": "jane.doe@example.com",
+				"sub":   "1234",
+				"exp":   now.Add(time.Hour).Unix(),
+				"iat":   now.Unix(),
+			},
+			wantErr: true,
+		},
+		{
+			name: "expired_token",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "email",
+			},
+			claims: map[string]interface{}{
+				"iss":            s.URL,
+				"aud":            "myid",
+				"email":          "jane.doe@example.com",
+				"email_verified": true,
+				"sub":            "1234",
+				"exp":            now.Add(-time.Hour).Unix(),
+				"iat":            now.Add(-2 * time.Hour).Unix(),
+			},
+			wantErr: true,
+		},
+		{
+			name: "groups",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "sub",
+				GroupsClaim:   "groups",
+			},
+			claims: map[string]interface{}{
+				"iss":    s.URL,
+				"aud":    "myid",
+				"sub":    "1234",
+				"exp":    now.Add(time.Hour).Unix(),
+				"iat":    now.Unix(),
+				"groups": []string{"team1", "team2"},
+			},
+			wantName:   s.URL + "#" + "1234",
+			wantGroups: []string{"team1", "team2"},
+		},
+		{
+			name: "single_group",
+			options: OIDCOptions{
+				IssuerURL:     s.URL,
+				ClientID:      "myid",
+				CAFile:        "testdata/ca.crt",
+				UsernameClaim: "sub",
+				GroupsClaim:   "groups",
+			},
+			claims: map[string]interface{}{
+				"iss":    s.URL,
+				"aud":    "myid",
+				"sub":    "1234",
+				"exp":    now.Add(time.Hour).Unix(),
+				"iat":    now.Unix(),
+				"groups": "team1",
+			},
+			wantName:   s.URL + "#" + "1234",
+			wantGroups: []string{"team1"},
 		},
 	}
 
-	for _, tc := range tests {
-		func() {
-			op := oidctesting.NewOIDCProvider(t, "")
-			srv, err := op.ServeTLSWithKeyPair(tc.serverCertFile, tc.serverKeyFile)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a, err := New(test.options)
 			if err != nil {
-				t.Errorf("%s: %v", tc.testCase, err)
+				t.Fatal(err)
+			}
+			defer a.Close()
+
+			data, err := json.Marshal(test.claims)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jwt, err := p.Sign(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			user, ok, err := a.AuthenticateToken(jwt)
+			if err != nil {
+				if !test.wantErr {
+					t.Errorf("authenticating token: %v", err)
+				}
 				return
 			}
-			defer srv.Close()
 
-			issuer := srv.URL
-			clientID := "client-foo"
-
-			options := OIDCOptions{
-				IssuerURL:     srv.URL,
-				ClientID:      clientID,
-				CAFile:        tc.trustedCertFile,
-				UsernameClaim: "email",
-				GroupsClaim:   "groups",
-			}
-
-			authenticator, err := New(options)
-			if err != nil {
-				t.Errorf("%s: failed to initialize authenticator: %v", tc.testCase, err)
+			if !ok {
+				t.Errorf("no user found in JWT")
 				return
 			}
-			defer authenticator.Close()
 
-			email := "user-1@example.com"
-			groups := []string{"group1", "group2"}
-			sort.Strings(groups)
-
-			token := generateGoodToken(t, op, issuer, "user-1", clientID, "email", email, "groups", groups)
-
-			// Because this authenticator behaves differently for subsequent requests, run these
-			// tests multiple times (but expect the same result).
-			for i := 1; i < 4; i++ {
-
-				user, ok, err := authenticator.AuthenticateToken(token)
-				if err != nil {
-					if !tc.wantErr {
-						t.Errorf("%s (req #%d): failed to authenticate token: %v", tc.testCase, i, err)
-					}
-					continue
-				}
-
-				if tc.wantErr {
-					t.Errorf("%s (req #%d): expected error authenticating", tc.testCase, i)
-					continue
-				}
-				if !ok {
-					t.Errorf("%s (req #%d): did not get user or error", tc.testCase, i)
-					continue
-				}
-
-				if gotUsername := user.GetName(); email != gotUsername {
-					t.Errorf("%s (req #%d): GetName() expected=%q got %q", tc.testCase, i, email, gotUsername)
-				}
-				gotGroups := user.GetGroups()
-				sort.Strings(gotGroups)
-				if !reflect.DeepEqual(gotGroups, groups) {
-					t.Errorf("%s (req #%d): GetGroups() expected=%q got %q", tc.testCase, i, groups, gotGroups)
-				}
+			if gotName := user.GetName(); gotName != test.wantName {
+				t.Errorf("wanted username %q got %q", test.wantName, gotName)
 			}
-		}()
+
+			gotGroups := user.GetGroups()
+			if !slicesMatch(gotGroups, test.wantGroups) {
+				t.Errorf("wanted groups %q got %q", test.wantGroups, gotGroups)
+			}
+		})
 	}
 }
 
-func TestOIDCAuthentication(t *testing.T) {
-	cert := path.Join(os.TempDir(), "oidc-cert")
-	key := path.Join(os.TempDir(), "oidc-key")
-
-	defer os.Remove(cert)
-	defer os.Remove(key)
-
-	oidctesting.GenerateSelfSignedCert(t, "127.0.0.1", cert, key)
-
-	// Ensure all tests pass when the issuer is not at a base URL.
-	for _, path := range []string{"", "/path/with/trailing/slash/"} {
-
-		// Create a TLS server and a client.
-		op := oidctesting.NewOIDCProvider(t, path)
-		srv, err := op.ServeTLSWithKeyPair(cert, key)
-		if err != nil {
-			t.Fatalf("Cannot start server: %v", err)
-		}
-		defer srv.Close()
-
-		tests := []struct {
-			userClaim   string
-			groupsClaim string
-			token       string
-			userInfo    user.Info
-			verified    bool
-			err         string
-		}{
-			{
-				"sub",
-				"",
-				generateGoodToken(t, op, srv.URL, "client-foo", "client-foo", "sub", "user-foo", "", nil),
-				&user.DefaultInfo{Name: fmt.Sprintf("%s#%s", srv.URL, "user-foo")},
-				true,
-				"",
-			},
-			{
-				// Use user defined claim (email here).
-				"email",
-				"",
-				generateGoodToken(t, op, srv.URL, "client-foo", "client-foo", "email", "foo@example.com", "", nil),
-				&user.DefaultInfo{Name: "foo@example.com"},
-				true,
-				"",
-			},
-			{
-				// Use user defined claim (email here).
-				"email",
-				"",
-				generateGoodToken(t, op, srv.URL, "client-foo", "client-foo", "email", "foo@example.com", "groups", []string{"group1", "group2"}),
-				&user.DefaultInfo{Name: "foo@example.com"},
-				true,
-				"",
-			},
-			{
-				// Use user defined claim (email here).
-				"email",
-				"groups",
-				generateGoodToken(t, op, srv.URL, "client-foo", "client-foo", "email", "foo@example.com", "groups", []string{"group1", "group2"}),
-				&user.DefaultInfo{Name: "foo@example.com", Groups: []string{"group1", "group2"}},
-				true,
-				"",
-			},
-			{
-				// Group claim is a string rather than an array. Map that string to a single group.
-				"email",
-				"groups",
-				generateGoodToken(t, op, srv.URL, "client-foo", "client-foo", "email", "foo@example.com", "groups", "group1"),
-				&user.DefaultInfo{Name: "foo@example.com", Groups: []string{"group1"}},
-				true,
-				"",
-			},
-			{
-				// Group claim is not a string or array of strings. Throw out this as invalid.
-				"email",
-				"groups",
-				generateGoodToken(t, op, srv.URL, "client-foo", "client-foo", "email", "foo@example.com", "groups", 1),
-				nil,
-				false,
-				"custom group claim contains invalid type: float64",
-			},
-			{
-				// Email not verified
-				"email",
-				"",
-				generateTokenWithUnverifiedEmail(t, op, srv.URL, "client-foo", "client-foo", "foo@example.com"),
-				nil,
-				false,
-				"email not verified",
-			},
-			{
-				"sub",
-				"",
-				generateMalformedToken(t, op, srv.URL, "client-foo", "client-foo", "sub", "user-foo", "", nil),
-				nil,
-				false,
-				"oidc: unable to verify JWT signature: no matching keys",
-			},
-			{
-				// Invalid 'aud'.
-				"sub",
-				"",
-				generateGoodToken(t, op, srv.URL, "client-foo", "client-bar", "sub", "user-foo", "", nil),
-				nil,
-				false,
-				"oidc: JWT claims invalid: invalid claims, 'aud' claim and 'client_id' do not match",
-			},
-			{
-				// Invalid issuer.
-				"sub",
-				"",
-				generateGoodToken(t, op, "http://foo-bar.com", "client-foo", "client-foo", "sub", "user-foo", "", nil),
-				nil,
-				false,
-				"oidc: JWT claims invalid: invalid claim value: 'iss'.",
-			},
-			{
-				"sub",
-				"",
-				generateExpiredToken(t, op, srv.URL, "client-foo", "client-foo", "sub", "user-foo", "", nil),
-				nil,
-				false,
-				"oidc: JWT claims invalid: token is expired",
-			},
-		}
-
-		for i, tt := range tests {
-			client, err := New(OIDCOptions{srv.URL, "client-foo", cert, tt.userClaim, tt.groupsClaim})
-			if err != nil {
-				t.Errorf("Unexpected error: %v", err)
-				continue
-			}
-
-			user, result, err := client.AuthenticateToken(tt.token)
-			if tt.err != "" {
-				if !strings.HasPrefix(err.Error(), tt.err) {
-					t.Errorf("#%d: Expecting: %v..., but got: %v", i, tt.err, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("#%d: Unexpected error: %v", i, err)
-				}
-			}
-			if !reflect.DeepEqual(tt.verified, result) {
-				t.Errorf("#%d: Expecting: %v, but got: %v", i, tt.verified, result)
-			}
-			if !reflect.DeepEqual(tt.userInfo, user) {
-				t.Errorf("#%d: Expecting: %v, but got: %v", i, tt.userInfo, user)
-			}
-			client.Close()
+func slicesMatch(s1, s2 []string) bool {
+	sort.Strings(s1)
+	sort.Strings(s2)
+	if len(s1) != len(s2) {
+		return false
+	}
+	for i, s := range s1 {
+		if s2[i] != s {
+			return false
 		}
 	}
+	return true
+}
+
+func TestInvalidJWTSignature(t *testing.T) {
+	var p *oidctest.Provider
+	f := func(w http.ResponseWriter, r *http.Request) { p.ServeHTTP(w, r) }
+	s := httptest.NewUnstartedServer(http.HandlerFunc(f))
+	cert, err := tls.LoadX509KeyPair("testdata/server.crt", "testdata/server.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	s.StartTLS()
+	defer s.Close()
+
+	p, err = oidctest.NewProvider(s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := OIDCOptions{
+		IssuerURL:     s.URL,
+		ClientID:      "myid",
+		CAFile:        "testdata/ca.crt",
+		UsernameClaim: "sub",
+	}
+
+	a, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	p2, err := oidctest.NewProvider(s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	claims := map[string]interface{}{
+		"iss": s.URL,
+		"aud": "myid",
+		"sub": "1234",
+		"exp": now.Add(time.Hour).Unix(),
+		"iat": now.Unix(),
+	}
+	data, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	goodJWT, err := p.Sign(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badJWT, err := p2.Sign(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := a.AuthenticateToken(goodJWT); err != nil {
+		t.Errorf("failed to authenticate good token: %v", err)
+	}
+	if _, _, err := a.AuthenticateToken(badJWT); err == nil {
+		t.Errorf("incorrectly authenticated token")
+	}
+}
+
+func TestInvalidSigningAlg(t *testing.T) {
+	testOpts := oidctest.Options{
+		NewKey: func() (priv, pub interface{}, err error) {
+			return []byte("foo"), []byte("foo"), nil
+		},
+		// Invalid signature algorithm. Ensure the plugin rejects this.
+		//
+		// We actually had a bug report once where the server was using this
+		// signature algorithm.
+		SigAlg: jose.HS256,
+	}
+
+	var p *oidctest.Provider
+	f := func(w http.ResponseWriter, r *http.Request) { p.ServeHTTP(w, r) }
+	s := httptest.NewUnstartedServer(http.HandlerFunc(f))
+	cert, err := tls.LoadX509KeyPair("testdata/server.crt", "testdata/server.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	s.StartTLS()
+	defer s.Close()
+
+	p, err = oidctest.NewProvider(s.URL, &testOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := OIDCOptions{
+		IssuerURL:     s.URL,
+		ClientID:      "myid",
+		CAFile:        "testdata/ca.crt",
+		UsernameClaim: "sub",
+	}
+
+	a, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	now := time.Now()
+	claims := map[string]interface{}{
+		"iss": s.URL,
+		"aud": "myid",
+		"sub": "1234",
+		"exp": now.Add(time.Hour).Unix(),
+		"iat": now.Unix(),
+	}
+	data, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwt, err := p.Sign(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.AuthenticateToken(jwt); err == nil {
+		t.Errorf("authenticator verified an invalid signature algorithm")
+	}
+}
+
+// TestUnavailableProvider ensure the authenticator can authenticate even if
+// it's initialized when the provider is unavailable.
+func TestUnavailableProvider(t *testing.T) {
+	var (
+		p         *oidctest.Provider
+		available int32 // 0 if unavailable.
+	)
+	f := func(w http.ResponseWriter, r *http.Request) {
+		if atomic.LoadInt32(&available) == 0 {
+			http.Error(w, "unavailable", http.StatusInternalServerError)
+			return
+		}
+		p.ServeHTTP(w, r)
+	}
+
+	s := httptest.NewUnstartedServer(http.HandlerFunc(f))
+	cert, err := tls.LoadX509KeyPair("testdata/server.crt", "testdata/server.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	s.StartTLS()
+	defer s.Close()
+
+	p, err = oidctest.NewProvider(s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	claims := map[string]interface{}{
+		"iss": s.URL,
+		"aud": "myid",
+		"sub": "1234",
+		"exp": now.Add(time.Hour).Unix(),
+		"iat": now.Unix(),
+	}
+	data, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jwt, err := p.Sign(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := OIDCOptions{
+		IssuerURL:     s.URL,
+		ClientID:      "myid",
+		CAFile:        "testdata/ca.crt",
+		UsernameClaim: "sub",
+	}
+
+	pollInterval := time.Millisecond * 50
+	a, err := newWithPollInterval(opts, pollInterval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	if _, _, err := a.AuthenticateToken(jwt); err == nil {
+		t.Errorf("incorrectly authenticated token when provider was unavailabe")
+	}
+
+	// Make provider available
+	atomic.StoreInt32(&available, 1)
+
+	var lastErr error
+	for i := 0; i < 20; i++ {
+		time.Sleep(pollInterval)
+		_, _, lastErr = a.AuthenticateToken(jwt)
+		if lastErr == nil {
+			return
+		}
+	}
+	t.Errorf("failed to authenticate token: %v", lastErr)
 }

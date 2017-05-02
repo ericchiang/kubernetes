@@ -84,19 +84,24 @@ type OIDCOptions struct {
 type OIDCAuthenticator struct {
 	issuerURL string
 
-	trustedClientID string
-
 	usernameClaim string
 	groupsClaim   string
 
 	// Contains an *oidc.IDTokenVerifier. Do not access directly. Use verifier() method.
 	oidcVerifier atomic.Value
 
-	close context.CancelFunc
+	// Any goroutines stared by the authenticator will stop once this cancel
+	// is called.
+	cancel context.CancelFunc
 }
 
 // New creates a token authenticator which validates OpenID Connect ID Tokens.
 func New(opts OIDCOptions) (*OIDCAuthenticator, error) {
+	return newWithPollInterval(opts, pollInterval)
+}
+
+// newWithPollInterval allows tests to specify a shorter poll interval.
+func newWithPollInterval(opts OIDCOptions, pollInterval time.Duration) (*OIDCAuthenticator, error) {
 	url, err := url.Parse(opts.IssuerURL)
 	if err != nil {
 		return nil, err
@@ -109,6 +114,9 @@ func New(opts OIDCOptions) (*OIDCAuthenticator, error) {
 	if opts.UsernameClaim == "" {
 		return nil, errors.New("no username claim provided")
 	}
+	if opts.ClientID == "" {
+		return nil, errors.New("no client ID provided")
+	}
 
 	var roots *x509.CertPool
 	if opts.CAFile != "" {
@@ -120,22 +128,20 @@ func New(opts OIDCOptions) (*OIDCAuthenticator, error) {
 		glog.Info("OIDC: No x509 certificates provided, will use host's root CA set")
 	}
 
-	// Copied from http.DefaultTransport.
 	tr := net.SetTransportDefaults(&http.Transport{
 		// According to golang's doc, if RootCAs is nil,
 		// TLS uses the host's root CA set.
 		TLSClientConfig: &tls.Config{RootCAs: roots},
 	})
 
-	ctx, cancel := context.WithCancel()
+	ctx, cancel := context.WithCancel(context.Background())
 	ctx = oidc.ClientContext(ctx, &http.Client{Transport: tr})
 
 	a := &OIDCAuthenticator{
-		issuerURL:       opts.IssuerURL,
-		trustedClientID: opts.ClientID,
-		usernameClaim:   opts.UsernameClaim,
-		groupsClaim:     opts.GroupsClaim,
-		cancel:          cancel,
+		issuerURL:     opts.IssuerURL,
+		usernameClaim: opts.UsernameClaim,
+		groupsClaim:   opts.GroupsClaim,
+		cancel:        cancel,
 	}
 
 	initAuthenticator := wait.ConditionFunc(func() (done bool, err error) {
@@ -149,11 +155,12 @@ func New(opts OIDCOptions) (*OIDCAuthenticator, error) {
 		}
 
 		verifier := p.Verifier(&oidc.Config{
-			ClientID: a.trustedClientID,
+			ClientID: opts.ClientID,
 			// TODO(ericchiang): Support more signing algorithms, possibly through a flag
 			// or by inpecting the id_token_signing_alg_values_supported metadata claim.
 			SupportedSigningAlgs: []string{oidc.RS256},
 		})
+
 		a.oidcVerifier.Store(verifier)
 		return true, nil
 	})
@@ -171,12 +178,12 @@ func New(opts OIDCOptions) (*OIDCAuthenticator, error) {
 
 // Close stops all goroutines used by the authenticator.
 func (a *OIDCAuthenticator) Close() {
-	a.close()
+	a.cancel()
 }
 
 func (a *OIDCAuthenticator) verifier() (*oidc.IDTokenVerifier, error) {
 	if v := a.oidcVerifier.Load(); v != nil {
-		return client.(*v.IDTokenVerifier), nil
+		return v.(*oidc.IDTokenVerifier), nil
 	}
 	return nil, errors.New("oidc: plugin failed to initialize")
 }
@@ -229,13 +236,14 @@ func (a *OIDCAuthenticator) AuthenticateToken(value string) (user.Info, bool, er
 	info := &user.DefaultInfo{Name: username}
 
 	if a.groupsClaim != "" {
-		groups, found, err := claims.StringsClaim(a.groupsClaim)
+		var groups []string
+		found, err := c.claim(a.groupsClaim, &groups)
 		if err != nil {
+			var group string
 			// Groups type is present but is not an array of strings, try to decode as a string.
-			group, _, err := claims.StringClaim(a.groupsClaim)
-			if err != nil {
+			if _, err := c.claim(a.groupsClaim, &group); err != nil {
 				// Custom claim is present, but isn't an array of strings or a string.
-				return nil, false, fmt.Errorf("custom group claim contains invalid type: %T", claims[a.groupsClaim])
+				return nil, false, fmt.Errorf("custom group claim contains invalid value: %q", c.m[a.groupsClaim])
 			}
 			info.Groups = []string{group}
 		} else if found {
@@ -245,20 +253,23 @@ func (a *OIDCAuthenticator) AuthenticateToken(value string) (user.Info, bool, er
 	return info, true, nil
 }
 
+// claims is a utility type for parsing JSON objects with dyanmic formats.
 type claims struct {
+	// Underlying object.
 	m map[string]json.RawMessage
 }
 
 func (c *claims) UnmarshalJSON(b []byte) error {
 	c.m = make(map[string]json.RawMessage)
-	return json.Unmarshal(b, c.m)
+	return json.Unmarshal(b, &c.m)
 }
 
+// claim attempts to parse the value of the JSON key.
 func (c *claims) claim(key string, into interface{}) (bool, error) {
 	rm, ok := c.m[key]
 	if !ok {
 		return false, nil
 	}
-	err = json.Unmarshal([]byte(rm), into)
-	return
+	err := json.Unmarshal([]byte(rm), into)
+	return true, err
 }
