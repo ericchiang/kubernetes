@@ -4,17 +4,16 @@ package oidctest
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 
 	jose "gopkg.in/square/go-jose.v2"
 )
 
 const (
 	keysPath = "/keys"
+	metaPath = "/.well-known/openid-configuration"
 )
 
 type metadata struct {
@@ -27,23 +26,22 @@ type metadata struct {
 	IDTokenSigningAlgValuesSupported []string `json:"id_token_signing_alg_values_supported"`
 }
 
-// Provider is an example
+// Provider is test implementation of an OpenID Connect provider that only
+// implements the keys endpoint.
 type Provider struct {
 	issuer string
 
 	options *Options
 
-	now time.Time
-
 	signingKey *jose.JSONWebKey
-	pubKeys    []*jose.JSONWebKey
+	pubKeys    *jose.JSONWebKeySet
 
 	mux http.Handler
 }
 
 // Options represents configuration options for the provider.
 //
-// As test cases are introduced, this.
+// As test cases are introduced, this struct will expand.
 type Options struct {
 	// NewKey returns a private and public key pair. If unspecified it defaults
 	// to generating RSA keys.
@@ -65,28 +63,50 @@ var defaultOptions = &Options{
 	SigAlg: jose.RS256,
 }
 
-func (p *Provider) NewProvider(issuer string, options *Options) *Provider {
+// NewProvider returns a test implementation of an OpenID Connect provider.
+func NewProvider(issuer string, options *Options) (*Provider, error) {
 	if options == nil {
 		options = defaultOptions
 	}
 	if options.NewKey == nil {
 		options.NewKey = defaultOptions.NewKey
 	}
-	if len(options.SigAlg) == nil {
+	if len(options.SigAlg) == 0 {
 		options.SigAlg = defaultOptions.SigAlg
 	}
 
-	p := &Provder{
+	priv, pub, err := options.NewKey()
+	if err != nil {
+		return nil, err
+	}
+
+	p := &Provider{
 		issuer:  issuer,
 		options: options,
+		signingKey: &jose.JSONWebKey{
+			Key:       priv,
+			KeyID:     "foo",
+			Algorithm: string(options.SigAlg),
+			Use:       "sign",
+		},
+		pubKeys: &jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{
+				{
+					Key:       pub,
+					KeyID:     "foo",
+					Algorithm: string(options.SigAlg),
+					Use:       "sign",
+				},
+			},
+		},
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/.well-known/openid-configuration", p.handleMetadata)
-	mux.Handle(keysPath, p.handleKeys)
+	mux.HandleFunc(metaPath, p.handleMetadata)
+	mux.HandleFunc(keysPath, p.handleKeys)
 
 	p.mux = mux
-	return p
+	return p, nil
 }
 
 func (p *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -94,52 +114,42 @@ func (p *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Provider) handleMetadata(w http.ResponseWriter, r *http.Request) {
+	m := metadata{
+		Issuer:  p.issuer,
+		JwksURI: p.issuer + keysPath,
+
+		// Not actually implemented.
+		AuthorizationEndpoint: p.issuer + "/auth",
+		TokenEndpoint:         p.issuer + "/token",
+
+		ResponseTypesSupported: []string{"code"},
+		SubjectTypesSupported:  []string{"public"},
+
+		IDTokenSigningAlgValuesSupported: []string{
+			string(p.options.SigAlg),
+		},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(m)
 }
 
 func (p *Provider) handleKeys(w http.ResponseWriter, r *http.Request) {
-}
-
-func (p *provider) Rotate() error {
-	priv, pub, err := p.options.NewKey()
-	if err != nil {
-		return fmt.Errorf("generate keys: %v", er)
-	}
-
-	jwkPriv := &jose.JSONWebKey{
-		Key:       priv,
-		Algorithm: string(p.options.SignatureAlg),
-		Use:       "sig",
-	}
-
-	// Key IDs are arbitary. We could just use a UUID, but using the thumbpring
-	// seems reasonable too. The client doesn't depend on this value.
-	t, err := jwkPriv.Thumbprint(sha256.New())
-	if err != nil {
-		return fmt.Errorf("calculating key id: %v", err)
-	}
-	kid := hex.EncodeToString(t)
-
-	jwkPriv.KeyID = kid
-
-	p.signingKey = jwkPriv
-	p.pubKeys = []*jose.JSONWebKey{{
-		Key:       pub,
-		KeyID:     kid,
-		Algorithm: string(p.options.SignatureAlg),
-		Use:       "sig",
-	}}
-	return nil
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p.pubKeys)
 }
 
 // Sign causes the provider to sign the provided payload.
 func (p *Provider) Sign(payload []byte) (string, error) {
-	s := jose.NewSigner(
+	s, err := jose.NewSigner(
 		jose.SigningKey{
-			Algorithm: jose.RS256,
+			Algorithm: p.options.SigAlg,
 			Key:       p.signingKey,
 		},
 		nil,
 	)
+	if err != nil {
+		return "", err
+	}
 	jws, err := s.Sign(payload)
 	if err != nil {
 		return "", err
