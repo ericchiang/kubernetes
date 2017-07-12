@@ -143,14 +143,29 @@ func ruleMatchesResource(r *audit.PolicyRule, attrs authorizer.Attributes) bool 
 
 	apiGroup := attrs.GetAPIGroup()
 	resource := attrs.GetResource()
+	fullResource := ""
+	if sr := attrs.GetSubresource(); sr != "" {
+		fullResource = resource + "/" + sr
+	}
+
+	name := attrs.GetName()
+
 	for _, gr := range r.Resources {
 		if gr.Group == apiGroup {
 			if len(gr.Resources) == 0 {
 				return true
 			}
-			for _, res := range gr.Resources {
-				if res == resource {
-					return true
+			for _, r := range gr.Resources {
+				// Resource either matches the resource directly or matches the
+				// resource + the subresource.
+				//
+				// 		"pods" matches "pods" and "pods/log"
+				//		"pods/log" only matches "pods/log"
+				//
+				if r == resource || (fullResource != "" && r == fullResource) {
+					if len(gr.ResourceNames) == 0 || hasString(gr.ResourceNames, name) {
+						return true
+					}
 				}
 			}
 		}
