@@ -253,8 +253,5 @@ func ValidateCloudProvider(provider string, fldPath *field.Path) field.ErrorList
 }
 
 func ValidateMixedArguments(flag *pflag.FlagSet) error {
-	if flag.Changed("config") && flag.NFlag() != 1 {
-		return fmt.Errorf("can not mix '--config' with other arguments")
-	}
 	return nil
 }
